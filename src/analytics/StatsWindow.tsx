@@ -6329,6 +6329,7 @@ function CoachingTab({
   globalSummary: string;
 }) {
   const [scenarioCoachingOverview, setScenarioCoachingOverview] = useState<ScenarioCoachingOverview | null>(null);
+  const [exportStatus, setExportStatus] = useState<"idle" | "busy" | "copied" | "error">("idle");
   const [localCoachQuestion, setLocalCoachQuestion] = useState("");
   const [localCoachGeneral, setLocalCoachGeneral] = useState(false);
   const [localCoachHistory, setLocalCoachHistory] = useState<LocalCoachTurn[]>([]);
@@ -6695,8 +6696,53 @@ function CoachingTab({
       .catch((error) => setLocalCoachError(String(error)));
   };
 
+  // Copies a Markdown report of everything behind this tab, to paste into Claude.
+  const copyCoachingExport = async () => {
+    setExportStatus("busy");
+    try {
+      const report = await invoke<string>("export_scenario_coaching_report", {
+        scenarioName,
+        dateRange: dateRange === "all" ? null : dateRange,
+      });
+      await navigator.clipboard.writeText(report);
+      setExportStatus("copied");
+    } catch (error) {
+      console.warn("Could not export scenario coaching", error);
+      setExportStatus("error");
+    }
+    window.setTimeout(() => setExportStatus("idle"), 2500);
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12, color: C.textFaint }}>
+          Copies this scenario's stats, runs and coaching as text to paste into Claude.
+        </span>
+        <button
+          type="button"
+          onClick={() => void copyCoachingExport()}
+          disabled={exportStatus === "busy"}
+          style={{
+            background: "transparent",
+            border: `1px solid ${C.border}`,
+            borderRadius: 6,
+            color: exportStatus === "error" ? "#ff8a8a" : C.textSub,
+            cursor: exportStatus === "busy" ? "wait" : "pointer",
+            fontSize: 12,
+            padding: "5px 12px",
+          }}
+        >
+          {exportStatus === "busy"
+            ? "Copying…"
+            : exportStatus === "copied"
+              ? "Copied"
+              : exportStatus === "error"
+                ? "Copy failed"
+                : "Copy for Claude"}
+        </button>
+      </div>
 
       {/* ── Peak performance section ──────────────────────────────────────── */}
       {showPeakSection && scores.length < 3 && (

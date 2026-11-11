@@ -2306,6 +2306,17 @@ fn get_scenario_coaching_overview(
         .map_err(|e| e.to_string())
 }
 
+/// Markdown report of one scenario's coaching data, for pasting into Claude.
+#[tauri::command]
+fn export_scenario_coaching_report(
+    app: AppHandle,
+    scenario_name: String,
+    date_range: Option<String>,
+) -> Result<String, String> {
+    coaching::export_scenario_coaching_report(&app, &scenario_name, date_range.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_session_run_coaching_analysis(
     app: AppHandle,
@@ -2622,6 +2633,7 @@ pub fn run() {
             get_session_history_page,
             get_global_coaching_overview,
             get_scenario_coaching_overview,
+            export_scenario_coaching_report,
             get_session_run_coaching_analysis,
             save_coaching_state_snapshot,
             get_coaching_state_snapshot,

@@ -3711,19 +3711,52 @@ pub fn get_global_overview(
     })
 }
 
+/// Everything the scenario coaching tab is computed from, kept so the export
+/// can include the inputs as well as the resulting cards.
+struct ScenarioAnalysis {
+    overview: ScenarioCoachingOverview,
+    all_records: Vec<AnalyticsRecord>,
+    scenario_records: Vec<AnalyticsRecord>,
+    warmup_ids: HashSet<String>,
+    practice_profile: Option<PracticeProfileSnapshot>,
+    fingerprint: Option<AimFingerprintMetrics>,
+    scenario_target_response: Option<TargetResponseAggregate>,
+    family_target_response: Option<TargetResponseAggregate>,
+}
+
 pub fn get_scenario_overview(
     app: &AppHandle,
     scenario_name: &str,
     date_range: Option<&str>,
 ) -> anyhow::Result<ScenarioCoachingOverview> {
+    analyze_scenario(app, scenario_name, date_range).map(|analysis| analysis.overview)
+}
+
+fn analyze_scenario(
+    app: &AppHandle,
+    scenario_name: &str,
+    date_range: Option<&str>,
+) -> anyhow::Result<ScenarioAnalysis> {
     let page = session_store::get_session_page(app, 0, 100_000);
     let records = filter_records_by_date_range(page.records, date_range);
+    let target_response_summaries =
+        stats_db::get_all_target_response_summaries(app).unwrap_or_default();
+    Ok(analyze_scenario_records(
+        records,
+        &target_response_summaries,
+        scenario_name,
+    ))
+}
+
+fn analyze_scenario_records(
+    records: Vec<SessionRecord>,
+    target_response_summaries: &HashMap<String, crate::target_response::TargetResponseSummaryRecord>,
+    scenario_name: &str,
+) -> ScenarioAnalysis {
     let mut analytics_records = build_analytics_records(records);
     analytics_records.sort_by_key(|record| record.timestamp_ms);
     let all_records = analytics_records.clone();
     let practice_profile = build_practice_profile(&analytics_records);
-    let target_response_summaries =
-        stats_db::get_all_target_response_summaries(app).unwrap_or_default();
     let normalized_name = normalize_scenario_name(scenario_name);
     let scenario_records = analytics_records
         .into_iter()
@@ -3806,18 +3839,388 @@ pub fn get_scenario_overview(
         Vec::new()
     };
 
-    Ok(ScenarioCoachingOverview {
-        scenario_type: dominant_type,
-        score_cv_pct,
-        slope_pts_per_run,
-        avg_score,
-        is_plateau,
-        p10_score: percentile(&scores, 10.0),
-        p50_score: percentile(&scores, 50.0),
-        p90_score: percentile(&scores, 90.0),
-        warmup_stats,
-        coaching_cards,
-    })
+    ScenarioAnalysis {
+        overview: ScenarioCoachingOverview {
+            scenario_type: dominant_type,
+            score_cv_pct,
+            slope_pts_per_run,
+            avg_score,
+            is_plateau,
+            p10_score: percentile(&scores, 10.0),
+            p50_score: percentile(&scores, 50.0),
+            p90_score: percentile(&scores, 90.0),
+            warmup_stats,
+            coaching_cards,
+        },
+        all_records,
+        scenario_records,
+        warmup_ids,
+        practice_profile,
+        fingerprint,
+        scenario_target_response,
+        family_target_response,
+    }
+}
+
+// ─── Scenario coaching export ────────────────────────────────────────────────
+
+/// Most recent runs listed in the export. Older runs still count in the summary.
+const EXPORT_MAX_RUNS: usize = 150;
+/// Related scenarios listed in the export.
+const EXPORT_MAX_RELATED: usize = 20;
+
+fn fmt_opt(value: Option<f64>, decimals: usize) -> String {
+    match value {
+        Some(v) if v.is_finite() => format!("{v:.decimals$}"),
+        _ => "-".to_string(),
+    }
+}
+
+fn fmt_opt32(value: Option<f32>, decimals: usize) -> String {
+    fmt_opt(value.map(f64::from), decimals)
+}
+
+/// `2026.11.11-18.04.33` -> `2026-11-11 18:04`.
+fn fmt_session_timestamp(ts: &str) -> String {
+    NaiveDateTime::parse_from_str(ts, "%Y.%m.%d-%H.%M.%S")
+        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+/// Text that is safe inside one Markdown table cell.
+fn md_cell(text: &str) -> String {
+    text.replace('|', "/").replace(['\r', '\n'], " ")
+}
+
+fn push_table_row(out: &mut String, name: &str, value: &str) {
+    out.push_str(&format!("| {name} | {value} |\n"));
+}
+
+fn push_target_response(out: &mut String, label: &str, tr: &TargetResponseAggregate) {
+    out.push_str(&format!(
+        "\n### Target response: {label} ({} runs)\n\n| Metric | Value |\n|---|---|\n",
+        tr.sample_count
+    ));
+    let rows = [
+        ("Reaction time (ms)", fmt_opt(tr.avg_reaction_time_ms, 0)),
+        ("Reaction before slowdown (ms)", fmt_opt(tr.avg_pre_slowdown_reaction_ms, 0)),
+        ("Recovery time (ms)", fmt_opt(tr.avg_recovery_time_ms, 0)),
+        ("Path-change reaction (ms)", fmt_opt(tr.avg_path_change_reaction_ms, 0)),
+        ("Target-switch reaction (ms)", fmt_opt(tr.avg_target_switch_reaction_ms, 0)),
+        ("Trigger magnitude (deg)", fmt_opt(tr.avg_trigger_magnitude_deg, 2)),
+        ("Peak yaw error (deg)", fmt_opt(tr.avg_peak_yaw_error_deg, 2)),
+        ("Stable response ratio", fmt_opt(tr.stable_response_ratio, 2)),
+        ("Response coverage (%)", fmt_opt(tr.response_coverage_pct, 0)),
+        ("Reaction trend (ms, negative = faster)", fmt_opt(tr.reaction_trend_delta_ms, 0)),
+        ("Recovery trend (ms, negative = faster)", fmt_opt(tr.recovery_trend_delta_ms, 0)),
+        ("Stable response trend (pct points)", fmt_opt(tr.stable_response_trend_pct, 1)),
+    ];
+    for (name, value) in rows {
+        if value != "-" {
+            push_table_row(out, name, &value);
+        }
+    }
+}
+
+/// Builds a Markdown report of everything behind one scenario's coaching tab,
+/// written to paste into Claude for advice and scenario recommendations.
+pub fn export_scenario_coaching_report(
+    app: &AppHandle,
+    scenario_name: &str,
+    date_range: Option<&str>,
+) -> anyhow::Result<String> {
+    let analysis = analyze_scenario(app, scenario_name, date_range)?;
+    Ok(render_scenario_report(&analysis, scenario_name, date_range))
+}
+
+fn render_scenario_report(
+    analysis: &ScenarioAnalysis,
+    scenario_name: &str,
+    date_range: Option<&str>,
+) -> String {
+    let overview = &analysis.overview;
+    let runs = &analysis.scenario_records;
+    let mut out = String::new();
+
+    out.push_str(&format!("# KovaaK's scenario coaching export: {scenario_name}\n\n"));
+    out.push_str(&format!(
+        "Exported from AimMod on {}. Date range: {}.\n\n",
+        Local::now().format("%Y-%m-%d"),
+        match date_range {
+            Some("30d") => "last 30 days",
+            Some("90d") => "last 90 days",
+            Some("365d") => "last 365 days",
+            _ => "all time",
+        }
+    ));
+    out.push_str(concat!(
+        "Please use this data to (1) explain my strengths and weaknesses on this scenario, ",
+        "(2) give concrete advice for improving, and (3) recommend KovaaK's scenarios to ",
+        "practice next, with reasons tied to the numbers below.\n\n",
+        "About the data: \"settled\" runs exclude warm-up runs at the start of a practice block; ",
+        "summary stats use settled runs when there are at least 3. \"Unreliable\" runs (aborted ",
+        "or incomplete) are listed but not analysed. Smoothness metrics come from the mouse hook: ",
+        "lower jitter, overshoot, speed variance, correction ratio and click CV are better, higher ",
+        "path efficiency is better. Aim fingerprint scores are 0-100, higher is better.\n",
+    ));
+
+    // ── Summary
+    let reliable: Vec<&AnalyticsRecord> =
+        runs.iter().filter(|r| r.is_reliable_for_analysis).collect();
+    let reliable_scores: Vec<f64> = reliable.iter().map(|r| r.record.score).collect();
+    let best = reliable_scores.iter().copied().reduce(f64::max);
+    let first10: Vec<f64> = reliable_scores.iter().take(10).copied().collect();
+    let last10: Vec<f64> = reliable_scores.iter().rev().take(10).copied().collect();
+    let practice_minutes: f64 = runs.iter().map(|r| r.record.duration_secs).sum::<f64>() / 60.0;
+    let warmup_count = reliable
+        .iter()
+        .filter(|r| analysis.warmup_ids.contains(&r.record.id))
+        .count();
+
+    out.push_str("\n## Summary\n\n| Metric | Value |\n|---|---|\n");
+    push_table_row(&mut out, "Scenario type", &overview.scenario_type);
+    if let Some(subtype) = reliable
+        .iter()
+        .rev()
+        .find_map(|r| r.record.stats_panel.as_ref().and_then(|p| p.scenario_subtype.clone()))
+    {
+        push_table_row(&mut out, "Scenario subtype", &subtype);
+    }
+    push_table_row(
+        &mut out,
+        "Runs (total / reliable / warm-up)",
+        &format!("{} / {} / {}", runs.len(), reliable.len(), warmup_count),
+    );
+    if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
+        push_table_row(
+            &mut out,
+            "First / last run",
+            &format!(
+                "{} / {}",
+                fmt_session_timestamp(&first.record.timestamp),
+                fmt_session_timestamp(&last.record.timestamp)
+            ),
+        );
+    }
+    push_table_row(&mut out, "Practice time (min)", &format!("{practice_minutes:.0}"));
+    push_table_row(&mut out, "Best score", &fmt_opt(best, 1));
+    push_table_row(&mut out, "Average score (settled)", &fmt_opt(overview.avg_score, 1));
+    push_table_row(
+        &mut out,
+        "Score p10 / p50 / p90",
+        &format!(
+            "{} / {} / {}",
+            fmt_opt(overview.p10_score, 1),
+            fmt_opt(overview.p50_score, 1),
+            fmt_opt(overview.p90_score, 1)
+        ),
+    );
+    // Only meaningful once the two windows don't overlap.
+    if reliable_scores.len() >= 20 {
+        push_table_row(
+            &mut out,
+            "First 10 avg / last 10 avg",
+            &format!("{:.1} / {:.1}", mean(&first10), mean(&last10)),
+        );
+    }
+    push_table_row(&mut out, "Score variation (CV %)", &fmt_opt(overview.score_cv_pct, 1));
+    push_table_row(&mut out, "Trend (points per run)", &fmt_opt(overview.slope_pts_per_run, 2));
+    push_table_row(
+        &mut out,
+        "Plateau detected",
+        if overview.is_plateau { "yes" } else { "no" },
+    );
+    if let Some(warmup) = overview.warmup_stats.as_ref() {
+        push_table_row(&mut out, "Warm-up drop (%)", &format!("{:.1}", warmup.drop_pct));
+        push_table_row(
+            &mut out,
+            "Warm-up runs per block",
+            &format!("{:.1}", warmup.avg_warmup_sessions),
+        );
+        push_table_row(&mut out, "Practice blocks analysed", &warmup.block_count.to_string());
+        push_table_row(&mut out, "Settle-in", &md_cell(&warmup.settle_in_label));
+        push_table_row(&mut out, "Warm-up advice", &md_cell(&warmup.action));
+    }
+
+    // ── Aim fingerprint
+    if let Some(fp) = analysis.fingerprint.as_ref() {
+        out.push_str("\n## Aim fingerprint (0-100, higher is better)\n\n| Axis | Score |\n|---|---|\n");
+        for (name, value) in [
+            ("Precision", fp.precision),
+            ("Speed", fp.speed),
+            ("Control", fp.control),
+            ("Consistency", fp.consistency),
+            ("Decisiveness", fp.decisiveness),
+            ("Rhythm", fp.rhythm),
+        ] {
+            push_table_row(&mut out, name, &format!("{value:.0}"));
+        }
+        out.push_str(&format!(
+            "\nRun-to-run volatility (0-100, lower is steadier): control {:.0}, rhythm {:.0}, consistency {:.0}.\n",
+            fp.control_volatility, fp.rhythm_volatility, fp.consistency_volatility
+        ));
+    }
+
+    // ── Target response
+    if analysis.scenario_target_response.is_some() || analysis.family_target_response.is_some() {
+        out.push_str("\n## Target response\n");
+        if let Some(tr) = analysis.scenario_target_response.as_ref() {
+            push_target_response(&mut out, "this scenario", tr);
+        }
+        if let Some(tr) = analysis.family_target_response.as_ref() {
+            push_target_response(
+                &mut out,
+                &format!("all {} scenarios", overview.scenario_type),
+                tr,
+            );
+        }
+    }
+
+    // ── Coaching cards
+    out.push_str("\n## AimMod coaching cards\n");
+    if overview.coaching_cards.is_empty() {
+        out.push_str("\nNo coaching cards yet (needs at least 3 settled runs).\n");
+    }
+    for card in &overview.coaching_cards {
+        out.push_str(&format!("\n### {} [{}]\n\n", card.title, card.badge));
+        if !card.body.is_empty() {
+            out.push_str(&format!("{}\n\n", card.body));
+        }
+        if !card.tip.is_empty() {
+            out.push_str(&format!("Tip: {}\n\n", card.tip));
+        }
+        if let Some(confidence) = card.confidence {
+            out.push_str(&format!("Confidence: {:.0}%\n\n", confidence * 100.0));
+        }
+        if !card.signals.is_empty() {
+            out.push_str(&format!("Signals: {}\n\n", card.signals.join(", ")));
+        }
+        if !card.drills.is_empty() {
+            let drills: Vec<&str> = card.drills.iter().map(|d| d.label.as_str()).collect();
+            out.push_str(&format!("Suggested drills: {}\n", drills.join("; ")));
+        }
+    }
+
+    // ── Other scenarios of the same type, for scenario recommendations
+    let current = normalize_scenario_name(scenario_name);
+    let mut related: HashMap<&str, (String, Vec<f64>, i64)> = HashMap::new();
+    for r in analysis.all_records.iter().filter(|r| r.is_reliable_for_analysis) {
+        if r.normalized_scenario == current
+            || scenario_type(&r.record.stats_panel) != overview.scenario_type
+        {
+            continue;
+        }
+        let entry = related
+            .entry(r.normalized_scenario.as_str())
+            .or_insert_with(|| (r.record.scenario.clone(), Vec::new(), 0));
+        entry.1.push(r.record.score);
+        entry.2 = entry.2.max(r.timestamp_ms);
+    }
+    if !related.is_empty() {
+        let mut related: Vec<_> = related.into_values().collect();
+        related.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        out.push_str(&format!(
+            "\n## Other {} scenarios I've played\n\n| Scenario | Runs | Best | Avg | Last 5 avg | Last played |\n|---|---|---|---|---|---|\n",
+            overview.scenario_type
+        ));
+        for (name, scores, last_ms) in related.into_iter().take(EXPORT_MAX_RELATED) {
+            let last5: Vec<f64> = scores.iter().rev().take(5).copied().collect();
+            let last_played = Local
+                .timestamp_millis_opt(last_ms)
+                .single()
+                .map(|t| t.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.1} | {:.1} | {} |\n",
+                md_cell(&name),
+                scores.len(),
+                fmt_opt(scores.iter().copied().reduce(f64::max), 1),
+                mean(&scores),
+                mean(&last5),
+                last_played
+            ));
+        }
+    }
+
+    // ── Practice habits
+    if let Some(profile) = analysis.practice_profile.as_ref() {
+        out.push_str("\n## Practice habits (all scenarios)\n\n| Metric | Value |\n|---|---|\n");
+        push_table_row(&mut out, "Sessions analysed", &profile.session_count.to_string());
+        push_table_row(
+            &mut out,
+            "Active days / span (days)",
+            &format!("{} / {}", profile.active_days, profile.span_days),
+        );
+        push_table_row(&mut out, "Days per week", &format!("{:.1}", profile.days_per_week));
+        push_table_row(&mut out, "Runs per practice block", &format!("{:.1}", profile.avg_block_runs));
+        push_table_row(
+            &mut out,
+            "Block length avg / max (min)",
+            &format!("{:.0} / {:.0}", profile.avg_block_minutes, profile.max_block_minutes),
+        );
+        push_table_row(
+            &mut out,
+            "Different scenarios played",
+            &profile.scenario_diversity.to_string(),
+        );
+        push_table_row(&mut out, "Scenario switch rate", &format!("{:.2}", profile.switch_rate));
+        if !profile.top_scenarios.is_empty() {
+            let top: Vec<String> = profile
+                .top_scenarios
+                .iter()
+                .map(|t| format!("{} ({} runs, {:.0}%)", t.scenario, t.count, t.share * 100.0))
+                .collect();
+            push_table_row(&mut out, "Most played", &md_cell(&top.join(", ")));
+        }
+    }
+
+    // ── Per-run table
+    out.push_str(&format!(
+        "\n## Runs (newest first, up to {EXPORT_MAX_RUNS})\n\n\
+         Flags: W = warm-up run, U = unreliable run. \"-\" means no data for that run.\n\n\
+         | Date | Score | Acc % | Kills | Avg TTK (ms) | TTK SD (ms) | Acc trend | Smooth | Jitter | Overshoot | Speed var | Path eff | Correction | Click CV | Fire-to-hit (ms) | Shots/hit | Flags |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+    ));
+    for r in runs.iter().rev().take(EXPORT_MAX_RUNS) {
+        let rec = &r.record;
+        let panel = rec.stats_panel.as_ref();
+        let smooth = rec.smoothness.as_ref();
+        let shots = rec.shot_timing.as_ref();
+        let mut flags = String::new();
+        if analysis.warmup_ids.contains(&rec.id) {
+            flags.push('W');
+        }
+        if !r.is_reliable_for_analysis {
+            flags.push('U');
+        }
+        let accuracy = panel
+            .and_then(|p| p.accuracy_pct)
+            .map(f64::from)
+            .or(Some(rec.accuracy));
+        let ttk = panel.and_then(|p| p.avg_ttk_ms).map(f64::from);
+        out.push_str(&format!(
+            "| {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            fmt_session_timestamp(&rec.timestamp),
+            rec.score,
+            fmt_opt(accuracy, 1),
+            rec.kills,
+            fmt_opt(ttk, 0),
+            fmt_opt32(panel.and_then(|p| p.ttk_std_ms), 0),
+            fmt_opt32(panel.and_then(|p| p.accuracy_trend), 1),
+            fmt_opt32(smooth.map(|s| s.composite), 0),
+            fmt_opt32(smooth.map(|s| s.jitter), 3),
+            fmt_opt32(smooth.map(|s| s.overshoot_rate), 3),
+            fmt_opt32(smooth.map(|s| s.velocity_std), 3),
+            fmt_opt32(smooth.map(|s| s.path_efficiency), 2),
+            fmt_opt32(smooth.map(|s| s.correction_ratio), 2),
+            fmt_opt32(smooth.map(|s| s.click_timing_cv), 2),
+            fmt_opt32(shots.and_then(|s| s.avg_fire_to_hit_ms), 0),
+            fmt_opt32(shots.and_then(|s| s.avg_shots_to_hit), 2),
+            flags,
+        ));
+    }
+
+    out
 }
 
 fn values_in_range(
@@ -3992,4 +4395,61 @@ pub fn get_session_run_coaching_analysis(
     Ok(SessionRunCoachingAnalysis {
         key_moments: moments,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(scenario: &str, index: u32, score: f64) -> SessionRecord {
+        // One run every 3 minutes, in a single practice block.
+        let minutes = 10 + index * 3;
+        SessionRecord {
+            id: format!("{scenario}-{index}"),
+            scenario: scenario.to_string(),
+            score,
+            accuracy: 80.0,
+            kills: 40,
+            deaths: 0,
+            duration_secs: 60.0,
+            avg_ttk: 0.4,
+            damage_done: 0.0,
+            timestamp: format!("2026.11.10-{:02}.{:02}.00", 10 + minutes / 60, minutes % 60),
+            smoothness: None,
+            stats_panel: Some(StatsPanelSnapshot {
+                scenario_type: "StaticClicking".to_string(),
+                accuracy_pct: Some(80.0),
+                avg_ttk_ms: Some(400.0),
+                ..Default::default()
+            }),
+            shot_timing: None,
+            has_replay: false,
+            replay_is_favorite: false,
+            replay_positions_count: 0,
+            replay_metrics_count: 0,
+            replay_frames_count: 0,
+        }
+    }
+
+    #[test]
+    fn scenario_report_lists_summary_runs_and_related_scenarios() {
+        let mut records: Vec<SessionRecord> = (0..8)
+            .map(|i| run("Test Scenario A", i, 900.0 + f64::from(i) * 10.0))
+            .collect();
+        records.extend((8..11).map(|i| run("Test Scenario B", i, 700.0)));
+
+        let analysis = analyze_scenario_records(records, &HashMap::new(), "Test Scenario A");
+        let report = render_scenario_report(&analysis, "Test Scenario A", Some("30d"));
+
+        assert!(report.starts_with("# KovaaK's scenario coaching export: Test Scenario A"));
+        assert!(report.contains("Date range: last 30 days."));
+        assert!(report.contains("| Scenario type | StaticClicking |"));
+        assert!(report.contains("| Best score | 970.0 |"));
+        assert!(report.contains("## Other StaticClicking scenarios I've played"));
+        assert!(report.contains("| Test Scenario B | 3 |"));
+        // Newest run first in the run table.
+        let newest = report.find("| 2026-11-10 10:31 | 970.0 |").expect("newest run row");
+        let oldest = report.find("| 2026-11-10 10:10 | 900.0 |").expect("oldest run row");
+        assert!(newest < oldest);
+    }
 }

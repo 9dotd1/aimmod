@@ -383,6 +383,8 @@ mod bridge;
 mod coaching;
 mod discord_rpc;
 mod file_watcher;
+#[cfg(target_os = "windows")]
+mod fthr_install;
 mod fthr_recorder;
 mod hub_api;
 mod hub_live_activity;
@@ -412,13 +414,14 @@ mod stats_db;
 mod steam_api;
 mod steam_integration;
 mod target_response;
+mod ui_mode;
 mod window_tracker;
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, Manager, Runtime,
-    menu::{Menu, MenuItem},
+    AppHandle, Emitter, Manager,
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
@@ -522,6 +525,22 @@ fn configure_overlay_window(win: &tauri::WebviewWindow) {
 fn configure_overlay_window(win: &tauri::WebviewWindow) {
     let _ = win.unmaximize();
     let _ = win.set_decorations(false);
+}
+
+/// One-time setup for a freshly created overlay window: click-through,
+/// fully transparent background, borderless popup style, then show.
+pub(crate) fn prepare_overlay_window(win: &tauri::WebviewWindow) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = win.set_ignore_cursor_events(true);
+        // Force the window background to fully transparent so the DWM
+        // compositor does not tint or dim the game colours underneath.
+        let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+        configure_overlay_window(win);
+        let _ = win.show();
+    }
+    #[cfg(target_os = "linux")]
+    let _ = win;
 }
 
 pub(crate) fn apply_overlay_bounds(
@@ -2046,8 +2065,22 @@ fn toggle_overlay(app: AppHandle) -> Result<(), String> {
         } else {
             win.show().map_err(|e| e.to_string())?;
         }
+    } else {
+        ui_mode::set_analysis_mode(&app, true);
     }
     Ok(())
+}
+
+/// Leave analysis mode: destroy every webview window so WebView2 exits while
+/// the background trackers keep running.
+#[tauri::command]
+fn enter_minimal_mode(app: AppHandle) {
+    ui_mode::set_analysis_mode(&app, false);
+}
+
+#[tauri::command]
+fn is_analysis_mode() -> bool {
+    ui_mode::is_analysis_mode()
 }
 
 #[tauri::command]
@@ -2058,13 +2091,14 @@ fn quit_app(app: AppHandle) {
 
 #[tauri::command]
 fn open_logs_window(app: AppHandle) -> Result<(), String> {
-    // The logs window is pre-created at startup (hidden) so we just show it.
-    // Avoids any dynamic window creation which can deadlock from a command handler.
+    // The logs window is created together with the other analysis windows, so
+    // it normally exists here. Otherwise build the analysis windows on a worker
+    // thread; creating a window inside a command handler can deadlock.
     if let Some(win) = app.get_webview_window("logs") {
         win.show().map_err(|e| e.to_string())?;
         win.set_focus().map_err(|e| e.to_string())?;
     } else {
-        log::error!("logs window not found — check tauri.conf.json");
+        ui_mode::set_analysis_mode(&app, true);
     }
     Ok(())
 }
@@ -2077,7 +2111,7 @@ fn open_stats_window(app: AppHandle) -> Result<(), String> {
         let _ = win.maximize();
         win.set_focus().map_err(|e| e.to_string())?;
     } else {
-        log::error!("stats window not found — check tauri.conf.json");
+        ui_mode::set_analysis_mode(&app, true);
     }
     Ok(())
 }
@@ -2528,6 +2562,10 @@ fn get_app_version_label() -> String {
 ///
 /// On other platforms we fall back to a PID file.
 fn focus_primary_window(app: &AppHandle) {
+    if !ui_mode::is_analysis_mode() {
+        ui_mode::set_analysis_mode(app, true);
+        return;
+    }
     for label in ["stats", "logs", "overlay"] {
         let Some(window) = app.get_webview_window(label) else {
             continue;
@@ -2539,7 +2577,7 @@ fn focus_primary_window(app: &AppHandle) {
     }
 }
 
-fn apply_window_titles(app: &AppHandle) {
+pub(crate) fn apply_window_titles(app: &AppHandle) {
     let app_title = app_version::app_name_with_version();
 
     if let Some(window) = app.get_webview_window("overlay") {
@@ -2599,6 +2637,8 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             quit_app,
+            enter_minimal_mode,
+            is_analysis_mode,
             open_logs_window,
             open_stats_window,
             get_osu_lazer_status,
@@ -2761,7 +2801,6 @@ pub fn run() {
                 "AimMod starting up — log file: {}",
                 logger::log_file_path().display()
             );
-            apply_window_titles(app.handle());
             discord_rpc::start();
             discord_rpc::update_presence_from_bridge(discord_rpc::BridgePresenceState {
                 game_state_code: 0,
@@ -2854,45 +2893,25 @@ pub fn run() {
             #[cfg(not(target_os = "linux"))]
             setup_tray(app)?;
 
-            // Configure the game overlay on supported platforms. On Linux the
-            // hidden GTK window is not realized yet, and asking Tao to alter
-            // its input shape would panic before the stats window can open.
-            #[cfg(not(target_os = "linux"))]
-            if let Some(win) = app.get_webview_window("overlay") {
-                let _ = win.set_ignore_cursor_events(true);
-                // Force the window background to fully transparent so the DWM
-                // compositor does not tint or dim the game colours underneath.
-                let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
-                configure_overlay_window(&win);
-                let _ = win.show();
-            }
-            // Ensure monitor placement + screen recorder capture rect are initialized
-            // on startup from persisted settings (without requiring manual monitor re-select).
-            apply_monitor(app.handle(), loaded.monitor_index);
+            // Minimal mode: no webview windows exist at launch, so WebView2 never
+            // starts. Trackers above run without any window. The tray (or a
+            // second launch, or F8) switches to analysis mode on demand.
             window_tracker::set_force_show(false);
             window_tracker::start(app.handle().clone());
             let initial_game_focus = window_tracker::is_game_focused();
             log::info!("Window tracker started (initial game focus={initial_game_focus})");
-
-            // Keep the stats window alive when the user clicks X so that its
-            // session-complete listener remains registered.  Closing hides
-            // instead of destroying; the window is shown again on the next
-            // session-complete event or via the tray menu.
-            if let Some(stats_win) = app.get_webview_window("stats") {
-                let w = stats_win.clone();
-                stats_win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        w.hide().ok();
-                    }
-                });
-            }
 
             Ok(())
         })
         .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // Destroying the last analysis window must not quit: the trackers
+            // keep running headless. Explicit exits (`app.exit`) carry a code.
+            if let tauri::RunEvent::ExitRequested { code: None, api, .. } = &event {
+                api.prevent_exit();
+                return;
+            }
             if let tauri::RunEvent::Exit = event {
                 osu_replay_host::stop_running_host();
                 // Kill the llama-server child process so it doesn't become an
@@ -2944,7 +2963,15 @@ mod embedded_frontend_tests {
     }
 }
 
-fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let analysis_mode = CheckMenuItem::with_id(
+        app,
+        "toggle_analysis_mode",
+        "Analysis Mode (open AimMod windows)",
+        true,
+        ui_mode::is_analysis_mode(),
+        None::<&str>,
+    )?;
     let open_settings =
         MenuItem::with_id(app, "open_settings", "Settings  (F8)", true, None::<&str>)?;
     let toggle_debug_state_hud = MenuItem::with_id(
@@ -2958,30 +2985,51 @@ fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::error:
     let toggle_overlay =
         MenuItem::with_id(app, "toggle_overlay", "Toggle AimMod", true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let mode_separator = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let install_fthr = MenuItem::with_id(
+        app,
+        "install_fthr_engine",
+        "Install Replay Video Engine (FTHR)",
+        cfg!(target_os = "windows"),
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(
         app,
         &[
+            &analysis_mode,
+            &mode_separator,
             &open_settings,
             &toggle_debug_state_hud,
             &open_stats,
             &toggle_overlay,
+            &install_fthr,
             &separator,
             &quit,
         ],
     )?;
 
+    ui_mode::register_tray_item(analysis_mode.clone());
+
     let mut tray_builder = TrayIconBuilder::with_id("main")
         .menu(&menu)
+        .show_menu_on_left_click(false)
         .tooltip(app_version::app_name_with_version());
     if let Some(icon) = app.default_window_icon() {
         tray_builder = tray_builder.icon(icon.clone());
     }
     let _tray = tray_builder
         .on_menu_event(|app, event| match event.id.as_ref() {
+            "toggle_analysis_mode" => ui_mode::toggle_analysis_mode(app),
+            #[cfg(target_os = "windows")]
+            "install_fthr_engine" => fthr_install::offer_install(app),
             "open_settings" => {
-                let _ = app.emit("toggle-settings", ());
+                if ui_mode::is_analysis_mode() {
+                    let _ = app.emit("toggle-settings", ());
+                } else {
+                    ui_mode::set_analysis_mode(app, true);
+                }
             }
             "toggle_debug_state_hud" => {
                 let _ = app.emit("toggle-debug-state-overlay", ());
@@ -2990,6 +3038,8 @@ fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::error:
                 if let Some(win) = app.get_webview_window("stats") {
                     let _ = win.show();
                     let _ = win.set_focus();
+                } else {
+                    ui_mode::set_analysis_mode(app, true);
                 }
             }
             "toggle_overlay" => {
@@ -2999,18 +3049,24 @@ fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::error:
                     } else {
                         let _ = win.show();
                     }
+                } else {
+                    ui_mode::set_analysis_mode(app, true);
                 }
             }
             "quit" => app.exit(0),
             _ => {}
         })
-        .on_tray_icon_event(|_tray, event| {
+        .on_tray_icon_event(|tray, event| {
+            // Left-click the tray icon to switch between minimal and analysis
+            // mode; right-click still opens the menu.
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
             } = event
-            {}
+            {
+                ui_mode::toggle_analysis_mode(tray.app_handle());
+            }
         })
         .build(app)?;
 

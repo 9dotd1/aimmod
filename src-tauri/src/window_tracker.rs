@@ -84,8 +84,8 @@ fn tracker_loop(app: AppHandle) {
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowRect, HWND_TOPMOST, SWP_HIDEWINDOW, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_SHOWWINDOW, SetWindowPos,
+        GetForegroundWindow, GetWindowRect, HWND_TOPMOST, IsWindow, SWP_HIDEWINDOW, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
     };
 
     const POLL_MS: u64 = 250;
@@ -134,7 +134,15 @@ fn tracker_loop(app: AppHandle) {
         // ── 2. Overlay HWND for the "settings open" check ─────────────────────
         // Resolve once and cache — get_webview_window() takes a Tauri manager
         // lock every call; calling it 4×/sec is unnecessary overhead.
+        // The overlay only exists in analysis mode and is destroyed when
+        // returning to minimal mode, so drop a stale handle and resync state
+        // when a new overlay window appears.
+        if overlay_hwnd.is_some_and(|oh| !unsafe { IsWindow(Some(oh)) }.as_bool()) {
+            overlay_hwnd = None;
+        }
         if overlay_hwnd.is_none() {
+            overlay_visible = false;
+            last_rect = None;
             overlay_hwnd = app
                 .get_webview_window("overlay")
                 .and_then(|w| w.hwnd().ok())

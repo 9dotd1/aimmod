@@ -272,6 +272,30 @@ pub fn start(session_start: Instant) {
     start_capture_backend(generation);
 }
 
+/// Moves the current session onto FTHR when the engine becomes ready after the
+/// session already started on the JPEG fallback. Frames captured so far stay.
+pub fn fthr_engine_ready() {
+    if !RECORDING.load(Ordering::SeqCst) || USING_FTHR.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(session_start) = *SESSION_START.lock().unwrap() else {
+        return;
+    };
+    if !crate::fthr_recorder::session_started(session_start) {
+        return;
+    }
+    USING_FTHR.store(true, Ordering::SeqCst);
+    // `stop()` may have run between the check above and now. Whichever side
+    // clears USING_FTHR first closes the FTHR session, so it closes once.
+    if !RECORDING.load(Ordering::SeqCst) {
+        if USING_FTHR.swap(false, Ordering::SeqCst) {
+            crate::fthr_recorder::session_stopped();
+        }
+        return;
+    }
+    log::info!("Screen recorder switched to FTHR for the running session");
+}
+
 /// Stop frame capture.
 pub fn stop() {
     PAUSED.store(false, Ordering::SeqCst);

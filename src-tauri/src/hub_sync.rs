@@ -1422,6 +1422,7 @@ async fn upload_replay_media_for_session(
         )
     })?;
 
+    let video_len = video_bytes.len();
     let url = format!(
         "{base_url}{REPLAY_MEDIA_UPLOAD_PATH}?sessionId={}&quality={}",
         urlencoding::encode(session_id),
@@ -1454,6 +1455,12 @@ async fn upload_replay_media_for_session(
         &settings.replay_media_upload_quality,
     )?;
     record_replay_media_upload_success(app, session_id);
+    log::info!(
+        "hub_sync: uploaded replay media for {} ({} bytes, quality={})",
+        session_id,
+        video_len,
+        settings.replay_media_upload_quality
+    );
     Ok(())
 }
 

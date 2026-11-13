@@ -94,7 +94,11 @@ mod imp {
     use windows::core::{PCWSTR, w};
 
     const INSTANCE_NAME: &str = "aimmod";
-    const SHARED_MEMORY_NAME: PCWSTR = w!("FTHR_SharedMemory_v4_aimmod");
+    /// Private-instance shared memory of the v4-aimmod engine (protocol v5).
+    const SHARED_MEMORY_NAME: PCWSTR = w!("FTHR_SharedMemory_v5_aimmod");
+    /// Optional event the host sets after writing a command so the idle-rate
+    /// private engine handles it at once instead of on its next tick.
+    const COMMAND_EVENT_NAME: PCWSTR = w!("FTHR_SharedMemory_v5_aimmod_Command");
     /// Replay buffer length. Runs longer than this lose their opening seconds.
     const BUFFER_SECONDS: u32 = 185;
     /// H.264: AimMod's WebView2 has no HEVC decoder (canPlayType("hvc1") is
@@ -129,11 +133,13 @@ mod imp {
     const RESP_SAVE_STARTED: u32 = 6;
     const HEALTH_BACKEND_FAILED: u32 = 1 << 2;
 
-    // ─── Shared memory (FTHR shared_memory.h, layout v4) ────────────────────────
+    // ─── Shared memory (FTHR shared_memory.h, protocol v5) ──────────────────────
     //
-    // Byte-for-byte copy of fthr::SharedMemoryLayout. C++ bool is one byte, so
-    // the bools are u8 here. The size assert catches most drift; the engine's
-    // own contract checker owns the rest.
+    // Byte-for-byte copy of the v4 prefix of fthr::SharedMemoryLayout. Protocol
+    // v5 only appends camera fields after it, which AimMod never reads, so
+    // mapping this prefix is enough. C++ bool is one byte, so the bools are u8
+    // here. The size assert catches most drift; the engine's own contract
+    // checker owns the rest.
     #[repr(C)]
     #[allow(dead_code)]
     struct SharedLayout {
@@ -183,7 +189,6 @@ mod imp {
     // ─── State ──────────────────────────────────────────────────────────────────
 
     struct Paths {
-        engine_exe: Option<PathBuf>,
         pending_dir: PathBuf,
         log_path: Option<PathBuf>,
     }
@@ -291,6 +296,8 @@ mod imp {
     }
 
     static PATHS: OnceCell<Paths> = OnceCell::new();
+    /// Set once an engine is found at startup or installed later.
+    static ENGINE_EXE: OnceCell<PathBuf> = OnceCell::new();
     static STATE: Lazy<Mutex<State>> = Lazy::new(|| Mutex::new(State::default()));
     static SAVES_DONE: Condvar = Condvar::new();
     /// Serializes SAVE_CLIP commands: the engine has one response slot. Holds
@@ -320,20 +327,46 @@ mod imp {
                 let _ = std::fs::create_dir_all(&dir);
                 dir.join("fthr-engine.log")
             });
-        if PATHS
-            .set(Paths {
-                engine_exe: engine_exe.clone(),
-                pending_dir,
-                log_path,
-            })
-            .is_err()
-        {
+        if PATHS.set(Paths { pending_dir, log_path }).is_err() {
             return;
         }
-        if engine_exe.is_some() {
-            let _ = std::thread::Builder::new()
-                .name("fthr-watch".into())
-                .spawn(watch_loop);
+        match engine_exe {
+            Some(path) => engine_available(path),
+            None => crate::fthr_install::offer_install_on_startup(app),
+        }
+    }
+
+    /// Where the engine installer puts FTHR (per-user, no admin rights).
+    pub fn managed_engine_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+        app.path()
+            .app_local_data_dir()
+            .ok()
+            .map(|dir| dir.join("tools").join("fthr-engine"))
+    }
+
+    pub fn engine_installed() -> bool {
+        ENGINE_EXE.get().is_some()
+    }
+
+    /// Registers an engine and starts the watcher. Later calls are ignored, so
+    /// an install finishing after startup takes effect without a restart.
+    pub fn engine_available(path: PathBuf) {
+        if PATHS.get().is_none() || ENGINE_EXE.set(path.clone()).is_err() {
+            return;
+        }
+        log::info!("fthr_recorder: engine ready at {}", path.display());
+        let _ = std::thread::Builder::new()
+            .name("fthr-watch".into())
+            .spawn(watch_loop);
+    }
+
+    fn wake_engine() {
+        use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, COMMAND_EVENT_NAME) } {
+            unsafe {
+                let _ = SetEvent(event);
+                let _ = CloseHandle(event);
+            }
         }
     }
 
@@ -675,6 +708,10 @@ mod imp {
             Ok(engine) => {
                 state.spawn_backoff_until = None;
                 state.engine = Some(engine);
+                drop(state);
+                // A session may already be running on the JPEG fallback, e.g.
+                // one restored at launch before the engine finished starting.
+                crate::screen_recorder::fthr_engine_ready();
             }
             Err(error) => {
                 log::warn!("fthr_recorder: engine start failed: {error}");
@@ -685,7 +722,7 @@ mod imp {
 
     fn spawn_engine(geometry: &Geometry) -> Result<Engine, String> {
         let paths = PATHS.get().ok_or("not initialized")?;
-        let exe = paths.engine_exe.as_ref().ok_or("engine not found")?;
+        let exe = ENGINE_EXE.get().ok_or("engine not found")?;
         let [cx, cy, cw, ch] = geometry.crop;
         let args: Vec<String> = vec![
             geometry.fps.to_string(),
@@ -836,6 +873,7 @@ mod imp {
         wr!(layout, ui_string, ui_string);
         wr!(layout, ui_param1, duration_s);
         wr!(layout, ui_command, CMD_SAVE_CLIP);
+        wake_engine();
 
         let deadline = Instant::now() + SAVE_TIMEOUT;
         loop {
@@ -1047,6 +1085,9 @@ mod imp {
         }
         if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
             candidates.push(dir.join("fthr-engine").join("FTHRclips.exe"));
+        }
+        if let Some(dir) = managed_engine_dir(app) {
+            candidates.push(dir.join("FTHRclips.exe"));
         }
         candidates.into_iter().find(|p| p.is_file())
     }

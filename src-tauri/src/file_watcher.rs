@@ -511,6 +511,8 @@ fn process_stats_csv(app: AppHandle, path: PathBuf) {
                 if let Some(win) = app.get_webview_window("stats") {
                     let _ = win.show();
                     let _ = win.set_focus();
+                } else {
+                    crate::ui_mode::set_analysis_mode(&app, true);
                 }
             }
         }

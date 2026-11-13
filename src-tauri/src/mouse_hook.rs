@@ -799,7 +799,17 @@ unsafe extern "system" fn raw_input_wnd_proc(
 
     if msg == WM_HOTKEY {
         match wparam.0 {
-            HOTKEY_ID_SETTINGS => emit_app_event("toggle-settings"),
+            HOTKEY_ID_SETTINGS => {
+                // In minimal mode there is no window to receive the event, so
+                // F8 opens the analysis windows instead.
+                if crate::ui_mode::is_analysis_mode() {
+                    emit_app_event("toggle-settings");
+                } else if let Ok(guard) = APP_HANDLE.lock() {
+                    if let Some(app) = guard.as_ref() {
+                        crate::ui_mode::set_analysis_mode(app, true);
+                    }
+                }
+            }
             HOTKEY_ID_DEBUG => emit_app_event("toggle-debug-state-overlay"),
             HOTKEY_ID_LAYOUT => emit_app_event("toggle-layout-huds"),
             _ => {}

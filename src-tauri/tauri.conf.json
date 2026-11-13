@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "overlay",
+        "create": false,
         "title": "AimMod",
         "url": "index.html",
         "transparent": true,
@@ -24,6 +25,7 @@
       },
       {
         "label": "logs",
+        "create": false,
         "title": "AimMod — Logs",
         "url": "logs.html",
         "decorations": true,
@@ -35,6 +37,7 @@
       },
       {
         "label": "stats",
+        "create": false,
         "title": "AimMod",
         "url": "stats.html",
         "decorations": true,

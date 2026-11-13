@@ -254,11 +254,29 @@ fn align_run_window_to_csv(
     if !csv_duration_secs.is_finite() || csv_duration_secs <= 0.0 || csv_end_unix_ms == 0 {
         return;
     }
+    // The bridge's own run duration can collapse to under a second after a
+    // recovered session (seen as 0.65s for a 60s run). The replay's mouse path
+    // is cut to this duration, so trust the CSV when the two disagree.
+    let csv_duration_ms = (csv_duration_secs * 1000.0).round() as u64;
+    let tracked_duration_ms = snapshot
+        .duration_secs
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .map(|secs| (secs * 1000.0).round() as u64);
+    if tracked_duration_ms.is_none_or(|ms| ms.abs_diff(csv_duration_ms) > TOLERANCE_MS) {
+        log::info!(
+            "file_watcher: run duration for {} corrected from {:?}s to the stats CSV {:.3}s",
+            scenario,
+            snapshot.duration_secs,
+            csv_duration_secs
+        );
+        snapshot.duration_secs = Some(csv_duration_secs);
+    }
+
     let Some(tracked_start) = snapshot.started_at_unix_ms else {
         return;
     };
     let tracked_end = snapshot.ended_at_unix_ms.unwrap_or(tracked_start);
-    let duration_ms = (csv_duration_secs * 1000.0).round() as u64;
+    let duration_ms = csv_duration_ms;
     let end = csv_end_unix_ms;
     let mut start = end.saturating_sub(duration_ms);
     // Challenge time excludes pauses, so a pause inside the run pushes the
@@ -772,6 +790,33 @@ fn find_timestamp(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn align_replaces_collapsed_bridge_duration_with_csv_duration() {
+        // A recovered session reported 0.65s for a 60s run, which cut the
+        // replay's mouse path to its first two seconds.
+        let mut snapshot = crate::bridge::BridgeRunSnapshot {
+            duration_secs: Some(0.65277),
+            started_at_unix_ms: Some(1_000_000),
+            ended_at_unix_ms: Some(1_060_000),
+            ..Default::default()
+        };
+        align_run_window_to_csv(&mut snapshot, 1_060_000, 60.0, "test");
+        assert_eq!(snapshot.duration_secs, Some(60.0));
+        assert_eq!(snapshot.started_at_unix_ms, Some(1_000_000));
+    }
+
+    #[test]
+    fn align_keeps_bridge_duration_within_tolerance() {
+        let mut snapshot = crate::bridge::BridgeRunSnapshot {
+            duration_secs: Some(59.4),
+            started_at_unix_ms: Some(1_000_000),
+            ended_at_unix_ms: Some(1_060_000),
+            ..Default::default()
+        };
+        align_run_window_to_csv(&mut snapshot, 1_060_000, 60.0, "test");
+        assert_eq!(snapshot.duration_secs, Some(59.4));
+    }
 
     #[test]
     fn parse_filename_challenge_start() {
